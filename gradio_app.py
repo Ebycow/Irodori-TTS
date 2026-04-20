@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
@@ -16,7 +15,6 @@ from irodori_tts.inference_runtime import (
     get_cached_runtime,
     list_available_runtime_devices,
     list_available_runtime_precisions,
-    save_wav,
 )
 
 FIXED_SECONDS = 30.0
@@ -278,34 +276,23 @@ def _run_generation(
         log_fn=stdout_log,
     )
 
-    out_dir = Path("gradio_outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    out_paths: list[str] = []
-    for i, audio in enumerate(result.audios, start=1):
-        out_path = save_wav(
-            out_dir / f"sample_{stamp}_{i:03d}.wav",
-            audio.float(),
-            result.sample_rate,
-        )
-        out_paths.append(str(out_path))
+    audio_tensors = [(result.sample_rate, a.float().squeeze(0).numpy()) for a in result.audios]
 
     runtime_msg = "runtime: reloaded" if reloaded else "runtime: reused"
     detail_lines = [
         runtime_msg,
         f"seed_used: {result.used_seed}",
         f"candidates: {len(result.audios)}",
-        *[f"saved[{i}]: {path}" for i, path in enumerate(out_paths, start=1)],
         *result.messages,
     ]
     detail_text = "\n".join(detail_lines)
     timing_text = _format_timings(result.stage_timings, result.total_to_decode)
-    stdout_log(f"[gradio] saved {len(out_paths)} candidates")
+    stdout_log(f"[gradio] generated {len(audio_tensors)} candidates")
 
     audio_updates: list[object] = []
     for i in range(MAX_GRADIO_CANDIDATES):
-        if i < len(out_paths):
-            audio_updates.append(gr.update(value=out_paths[i], visible=True))
+        if i < len(audio_tensors):
+            audio_updates.append(gr.update(value=audio_tensors[i], visible=True))
         else:
             audio_updates.append(gr.update(value=None, visible=False))
     return (*audio_updates, detail_text, timing_text)
@@ -439,7 +426,7 @@ def build_ui() -> gr.Blocks:
                         out_audios.append(
                             gr.Audio(
                                 label=f"Generated Audio {i + 1}",
-                                type="filepath",
+                                type="numpy",
                                 interactive=False,
                                 visible=(i == 0),
                                 min_width=160,

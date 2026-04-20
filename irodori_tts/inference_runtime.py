@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from collections.abc import Callable
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,6 +162,7 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
+    reference_cache_size: int = 16
 
 
 @dataclass
@@ -416,6 +418,12 @@ class InferenceRuntime:
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
         self._infer_lock = threading.Lock()
+        self.reference_cache_size = max(0, int(key.reference_cache_size))
+        self._reference_cache_lock = threading.Lock()
+        self._reference_cache: OrderedDict[
+            tuple[str, str, int, int, float | None, float | None, bool, int, str],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = OrderedDict()
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
@@ -506,6 +514,83 @@ class InferenceRuntime:
             default_caption_max_len=default_caption_max_len,
         )
 
+    def _build_reference_cache_key(
+        self,
+        *,
+        req: SamplingRequest,
+        runtime_dtype: torch.dtype,
+    ) -> tuple[str, str, int, int, float | None, float | None, bool, int, str] | None:
+        if self.reference_cache_size <= 0 or req.no_ref:
+            return None
+
+        if req.ref_latent is not None:
+            kind = "latent"
+            ref_path = req.ref_latent
+            normalize_db = None
+            ensure_max = False
+        elif req.ref_wav is not None:
+            kind = "wav"
+            ref_path = req.ref_wav
+            normalize_db = (
+                None if req.ref_normalize_db is None else float(req.ref_normalize_db)
+            )
+            ensure_max = bool(req.ref_ensure_max)
+        else:
+            return None
+
+        resolved = Path(ref_path).expanduser().resolve()
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return None
+
+        max_ref_seconds = (
+            None
+            if req.max_ref_seconds is None or req.max_ref_seconds <= 0
+            else float(req.max_ref_seconds)
+        )
+        return (
+            kind,
+            str(resolved),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            max_ref_seconds,
+            normalize_db,
+            ensure_max,
+            int(self.model_cfg.latent_patch_size),
+            str(runtime_dtype),
+        )
+
+    def _get_cached_reference(
+        self,
+        cache_key: tuple[str, str, int, int, float | None, float | None, bool, int, str] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if cache_key is None:
+            return None
+        with self._reference_cache_lock:
+            cached = self._reference_cache.get(cache_key)
+            if cached is None:
+                return None
+            self._reference_cache.move_to_end(cache_key)
+            return cached
+
+    def _store_cached_reference(
+        self,
+        cache_key: tuple[str, str, int, int, float | None, float | None, bool, int, str] | None,
+        ref_latent_patched: torch.Tensor,
+        ref_mask: torch.Tensor,
+    ) -> None:
+        if cache_key is None:
+            return
+        with self._reference_cache_lock:
+            self._reference_cache[cache_key] = (
+                ref_latent_patched.contiguous(),
+                ref_mask.contiguous(),
+            )
+            self._reference_cache.move_to_end(cache_key)
+            while len(self._reference_cache) > self.reference_cache_size:
+                self._reference_cache.popitem(last=False)
+
     def _load_reference_latent(
         self,
         *,
@@ -538,6 +623,18 @@ class InferenceRuntime:
 
         if req.ref_wav is None and req.ref_latent is None:
             raise ValueError("Specify either ref_wav/ref_latent, or set no_ref=True.")
+
+        cache_key = self._build_reference_cache_key(req=req, runtime_dtype=runtime_dtype)
+        cached_reference = self._get_cached_reference(cache_key)
+        if cached_reference is not None:
+            messages.append("info: reused cached reference latent.")
+            ref_latent_patched_single, ref_mask_single = cached_reference
+            if batch_size > 1:
+                return (
+                    ref_latent_patched_single.repeat(batch_size, 1, 1),
+                    ref_mask_single.repeat(batch_size, 1),
+                )
+            return ref_latent_patched_single, ref_mask_single
 
         max_ref_latent_steps = None
         if req.max_ref_seconds is not None and req.max_ref_seconds > 0:
@@ -586,18 +683,29 @@ class InferenceRuntime:
             )
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
-        ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
+        ref_latent_patched_single = patchify_latent(
+            ref_latent,
+            self.model_cfg.latent_patch_size,
+        ).to(
             self.model_device
         )
-        if ref_latent_patched.shape[1] == 0:
+        if ref_latent_patched_single.shape[1] == 0:
             raise ValueError(
                 "Reference latent length became zero after patchify. Use longer reference audio."
             )
-        if batch_size > 1:
-            ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
-        ref_mask = torch.ones(
-            (batch_size, ref_latent_patched.shape[1]), dtype=torch.bool, device=self.model_device
+        ref_mask_single = torch.ones(
+            (1, ref_latent_patched_single.shape[1]),
+            dtype=torch.bool,
+            device=self.model_device,
         )
+        self._store_cached_reference(cache_key, ref_latent_patched_single, ref_mask_single)
+        if batch_size > 1:
+            return (
+                ref_latent_patched_single.repeat(batch_size, 1, 1),
+                ref_mask_single.repeat(batch_size, 1),
+            )
+        ref_latent_patched = ref_latent_patched_single
+        ref_mask = ref_mask_single
         return ref_latent_patched, ref_mask
 
     def synthesize(
@@ -884,6 +992,8 @@ class InferenceRuntime:
         )
 
     def unload(self) -> None:
+        with self._reference_cache_lock:
+            self._reference_cache.clear()
         del self.model
         del self.tokenizer
         del self.codec
