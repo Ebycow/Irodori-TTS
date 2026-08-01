@@ -141,7 +141,7 @@ def generate_tts(req: TtsRequest):
         and req.caption is not None
         and req.caption.strip() != ""
     )
-    use_speaker = _runtime.model_cfg.use_speaker_condition and not use_no_ref
+    use_speaker = _runtime.model_cfg.use_speaker_condition_resolved and not use_no_ref
 
     # Adjust cfg scales: zero out unused conditioning branches
     cfg_scale_text = req.cfg_scale_text
