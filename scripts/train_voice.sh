@@ -4,6 +4,7 @@
 #
 # Usage:
 #   scripts/train_voice.sh NAME [--review] [--trim] [--rebuild] [--force] [--small]
+#                               [--scale-steps] [--grad-ckpt]
 #
 #   --review   stop after transcription so metadata.csv can be corrected; rerun to continue
 #   --trim     cut non-speech stretches (SFX/noise/silence) from every clip while transcribing;
@@ -12,19 +13,34 @@
 #              keeps metadata.csv
 #   --force    redo every step even if its output already exists (overwrites metadata.csv)
 #   --small    use the v4-Small config/checkpoint instead of v4-Large
+#   --scale-steps  divide the config's max_steps by NGPU (same samples seen, shorter run);
+#                  without it, extra GPUs only grow the effective batch size
+#   --grad-ckpt    keep gradient checkpointing on (off by default: faster, needs more VRAM)
 #
 # Check transcripts against the audio: scripts/verify_transcripts.py data/NAME
-# Environment overrides: CKPT, CONFIG, WHISPER_ARGS (e.g. "--device cpu --compute-type int8").
+# Environment overrides: CKPT, CONFIG, WHISPER_ARGS (e.g. "--device cpu --compute-type int8"),
+#   NGPU (GPUs for manifest prep + DDP training; default: SLURM_GPUS_ON_NODE under srun, else the
+#   number of entries in CUDA_VISIBLE_DEVICES, else 1).
 # Needs HF login (google/t5gemma-2-1b-1b is gated) and FFmpeg shared libs on LD_LIBRARY_PATH.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NAME="${1:-}"
-[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,20p "$0"; exit 1; }
+[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,26p "$0"; exit 1; }
 shift
 
-REVIEW=0; FORCE=0; REBUILD=0; TRIM_ARGS=; MODEL=large
+REVIEW=0; FORCE=0; REBUILD=0; TRIM_ARGS=; MODEL=large; SCALE_STEPS=0; GRAD_CKPT=--no-gradient-checkpointing
+if [[ -z "${NGPU:-}" ]]; then
+  if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
+    NGPU="$SLURM_GPUS_ON_NODE"
+  elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=, read -ra _gpus <<< "$CUDA_VISIBLE_DEVICES"
+    NGPU="${#_gpus[@]}"
+  else
+    NGPU=1
+  fi
+fi
 for arg in "$@"; do
   case "$arg" in
     --review) REVIEW=1 ;;
@@ -32,6 +48,8 @@ for arg in "$@"; do
     --rebuild) REBUILD=1 ;;
     --trim) TRIM_ARGS=--trim ;;
     --small) MODEL=small ;;
+    --scale-steps) SCALE_STEPS=1 ;;
+    --grad-ckpt) GRAD_CKPT=--gradient-checkpointing ;;
     *) echo "unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -56,6 +74,7 @@ for ext in wav flac mp3 ogg; do
 done
 [[ $found -eq 1 ]] || { echo "no .wav/.flac/.mp3/.ogg files in $AUDIO_DIR" >&2; exit 1; }
 [[ -f "$CKPT" ]] || { echo "checkpoint not found: $CKPT (set CKPT=...)" >&2; exit 1; }
+[[ "$NGPU" =~ ^[1-9][0-9]*$ ]] || { echo "NGPU must be a positive integer: $NGPU" >&2; exit 1; }
 
 echo "== [1/3] transcribe: $AUDIO_DIR"
 if [[ $FORCE -eq 1 || ! -f "$AUDIO_DIR/metadata.csv" ]]; then
@@ -83,16 +102,25 @@ if [[ $FORCE -eq 1 || $REBUILD -eq 1 || ! -s "$MANIFEST" ]]; then
     --text-column text \
     --output-manifest "$MANIFEST" \
     --latent-dir "$LATENT_DIR" \
-    --device cuda
+    --device cuda \
+    --num-gpus "$NGPU" \
+    --merge-output
 else
   echo "manifest exists, skipping (use --rebuild to redo)"
 fi
 
-echo "== [3/3] train ($MODEL): $OUT_DIR"
-uv run --no-sync python train.py \
-  --config "$CONFIG" \
-  --manifest "$MANIFEST" \
-  --init-checkpoint "$CKPT" \
-  --output-dir "$OUT_DIR"
+TRAIN_ARGS=(--config "$CONFIG" --manifest "$MANIFEST" --init-checkpoint "$CKPT" --output-dir "$OUT_DIR" "$GRAD_CKPT")
+if [[ $SCALE_STEPS -eq 1 ]]; then
+  MAX_STEPS=$(awk '/^[[:space:]]*max_steps:/ {print $2; exit}' "$CONFIG")
+  [[ -n "$MAX_STEPS" ]] || { echo "max_steps not found in $CONFIG" >&2; exit 1; }
+  TRAIN_ARGS+=(--max-steps $(( (MAX_STEPS + NGPU - 1) / NGPU )))
+fi
+
+echo "== [3/3] train ($MODEL, ${NGPU} GPU): $OUT_DIR"
+if [[ "$NGPU" -gt 1 ]]; then
+  uv run --no-sync torchrun --standalone --nproc_per_node "$NGPU" train.py "${TRAIN_ARGS[@]}"
+else
+  uv run --no-sync python train.py "${TRAIN_ARGS[@]}"
+fi
 
 echo "Done: $OUT_DIR/checkpoint_final.speaker.safetensors"

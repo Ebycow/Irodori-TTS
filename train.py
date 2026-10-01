@@ -3833,10 +3833,13 @@ def main() -> None:
             ref_min_frames=ref_min_frames_cfg,
             ref_max_frames=ref_max_frames_cfg,
         )
-    drop_last = len(train_dataset) >= train_cfg.batch_size
+    # Each rank sees len/world_size samples, so compare against the global batch size.
+    global_batch_size = train_cfg.batch_size * world_size
+    drop_last = len(train_dataset) >= global_batch_size
     if not drop_last and is_main_process:
         print(
-            f"warning: dataset size ({len(train_dataset)}) is smaller than batch_size ({train_cfg.batch_size}). "
+            f"warning: dataset size ({len(train_dataset)}) is smaller than the global batch size "
+            f"({train_cfg.batch_size} x {world_size} GPU = {global_batch_size}). "
             "Using drop_last=False to avoid empty dataloader."
         )
     collator = TTSCollator(
