@@ -4,7 +4,7 @@
 #
 # Usage:
 #   scripts/train_voice.sh NAME [--review] [--trim] [--rebuild] [--force] [--small]
-#                               [--scale-steps] [--grad-ckpt]
+#                               [--scale-steps] [--grad-ckpt] [--init-embed PATH]
 #
 #   --review   stop after transcription so metadata.csv can be corrected; rerun to continue
 #   --trim     cut non-speech stretches (SFX/noise/silence) from every clip while transcribing;
@@ -16,9 +16,13 @@
 #   --scale-steps  divide the config's max_steps by NGPU (same samples seen, shorter run);
 #                  without it, extra GPUs only grow the effective batch size
 #   --grad-ckpt    keep gradient checkpointing on (off by default: faster, needs more VRAM)
+#   --init-embed PATH  start from a shared .speaker.safetensors instead of random tokens, so
+#                  speakers trained from the same base stay token-aligned and can be blended;
+#                  the token count follows the file, and output goes to
+#                  outputs/speaker_inversion/NAME_MODEL_from-BASE unless OUT_DIR is set
 #
 # Check transcripts against the audio: scripts/verify_transcripts.py data/NAME
-# Environment overrides: CKPT, CONFIG, WHISPER_ARGS (e.g. "--device cpu --compute-type int8"),
+# Environment overrides: CKPT, CONFIG, OUT_DIR, WHISPER_ARGS (e.g. "--device cpu --compute-type int8"),
 #   NGPU (GPUs for manifest prep + DDP training; default: SLURM_GPUS_ON_NODE under srun, else the
 #   number of entries in CUDA_VISIBLE_DEVICES, else 1).
 # Needs HF login (google/t5gemma-2-1b-1b is gated) and FFmpeg shared libs on LD_LIBRARY_PATH.
@@ -27,10 +31,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NAME="${1:-}"
-[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,26p "$0"; exit 1; }
+[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,28p "$0"; exit 1; }
 shift
 
 REVIEW=0; FORCE=0; REBUILD=0; TRIM_ARGS=; MODEL=large; SCALE_STEPS=0; GRAD_CKPT=--no-gradient-checkpointing
+INIT_EMBED=
 if [[ -z "${NGPU:-}" ]]; then
   if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
     NGPU="$SLURM_GPUS_ON_NODE"
@@ -41,7 +46,8 @@ if [[ -z "${NGPU:-}" ]]; then
     NGPU=1
   fi
 fi
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+  arg="$1"; shift
   case "$arg" in
     --review) REVIEW=1 ;;
     --force) FORCE=1 ;;
@@ -50,6 +56,10 @@ for arg in "$@"; do
     --small) MODEL=small ;;
     --scale-steps) SCALE_STEPS=1 ;;
     --grad-ckpt) GRAD_CKPT=--gradient-checkpointing ;;
+    --init-embed)
+      [[ $# -gt 0 ]] || { echo "--init-embed needs a path" >&2; exit 1; }
+      INIT_EMBED="$1"; shift ;;
+    --init-embed=*) INIT_EMBED="${arg#*=}" ;;
     *) echo "unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -65,7 +75,17 @@ fi
 AUDIO_DIR="data/$NAME"
 MANIFEST="data/${NAME}_manifest.jsonl"
 LATENT_DIR="data/${NAME}_latents"
-OUT_DIR="outputs/speaker_inversion/${NAME}_${MODEL}"
+if [[ -n "$INIT_EMBED" ]]; then
+  [[ -f "$INIT_EMBED" ]] || { echo "init embedding not found: $INIT_EMBED" >&2; exit 1; }
+  [[ "$INIT_EMBED" == *.speaker.safetensors ]] || {
+    echo "init embedding must be a .speaker.safetensors file: $INIT_EMBED" >&2; exit 1; }
+  # checkpoint_*.speaker.safetensors says nothing about the base, so name it after its run dir.
+  INIT_STEM="$(basename "$INIT_EMBED" .speaker.safetensors)"
+  [[ "$INIT_STEM" == checkpoint_* ]] && INIT_STEM="$(basename "$(dirname "$INIT_EMBED")")"
+  OUT_DIR="${OUT_DIR:-outputs/speaker_inversion/${NAME}_${MODEL}_from-${INIT_STEM}}"
+else
+  OUT_DIR="${OUT_DIR:-outputs/speaker_inversion/${NAME}_${MODEL}}"
+fi
 
 [[ -d "$AUDIO_DIR" ]] || { echo "missing directory: $AUDIO_DIR" >&2; exit 1; }
 found=0
@@ -114,6 +134,13 @@ if [[ $SCALE_STEPS -eq 1 ]]; then
   MAX_STEPS=$(awk '/^[[:space:]]*max_steps:/ {print $2; exit}' "$CONFIG")
   [[ -n "$MAX_STEPS" ]] || { echo "max_steps not found in $CONFIG" >&2; exit 1; }
   TRAIN_ARGS+=(--max-steps $(( (MAX_STEPS + NGPU - 1) / NGPU )))
+fi
+if [[ -n "$INIT_EMBED" ]]; then
+  INIT_TOKENS=$(uv run --no-sync python -c \
+    'import sys; from safetensors import safe_open; print(safe_open(sys.argv[1], "pt").get_slice("speaker_embedding").get_shape()[-2])' \
+    "$INIT_EMBED")
+  echo "init embedding: $INIT_EMBED ($INIT_TOKENS tokens)"
+  TRAIN_ARGS+=(--speaker-inversion-init-embedding "$INIT_EMBED" --speaker-inversion-tokens "$INIT_TOKENS")
 fi
 
 echo "== [3/3] train ($MODEL, ${NGPU} GPU): $OUT_DIR"
