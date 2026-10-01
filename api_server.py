@@ -19,6 +19,7 @@ from irodori_tts.inference_runtime import (
     RuntimeKey,
     SamplingRequest,
     default_runtime_device,
+    download_hf_checkpoint,
 )
 
 app = FastAPI(title="Irodori-TTS API")
@@ -44,7 +45,7 @@ class TtsRequest(BaseModel):
     text: str
     voice_id: str = "no_ref"
     caption: str | None = None
-    num_steps: int = 40
+    num_steps: int | None = None  # None: model default (RF: 40, MeanFlow: 4)
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
@@ -184,8 +185,7 @@ def _load_runtime(args: argparse.Namespace) -> None:
 
     checkpoint = args.checkpoint
     if checkpoint is None:
-        from huggingface_hub import hf_hub_download
-        checkpoint = hf_hub_download(repo_id=args.hf_checkpoint, filename="model.safetensors")
+        checkpoint = download_hf_checkpoint(args.hf_checkpoint)
 
     key = RuntimeKey(
         checkpoint=str(checkpoint),
@@ -207,7 +207,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Irodori-TTS HTTP API server for SillyTavern.")
     ckpt_group = parser.add_mutually_exclusive_group(required=True)
     ckpt_group.add_argument("--checkpoint", default=None, help="Local checkpoint path (.pt/.safetensors).")
-    ckpt_group.add_argument("--hf-checkpoint", default=None, help="Hugging Face repo id.")
+    ckpt_group.add_argument("--hf-checkpoint", default=None, help="Hugging Face repo id or repo/subfolder.")
     parser.add_argument("--ref-dir", default="references", help="Directory containing reference audio files.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8799)
