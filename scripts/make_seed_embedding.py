@@ -10,7 +10,7 @@ Token count, dim and std default to the Speaker Inversion config (Large unless -
 otherwise).
 
   uv run --no-sync python scripts/make_seed_embedding.py --seed 0
-  -> outputs/speaker_inversion/seeds/seed0_large.speaker.safetensors
+  -> outputs/speaker_inversion/seeds/seed0_std0.02_large.speaker.safetensors
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def main() -> None:
     parser.add_argument("--std", type=float, help="init stddev (default: from config)")
     parser.add_argument(
         "--output",
-        help="output path (default: outputs/speaker_inversion/seeds/seed<SEED>_<MODEL>"
+        help="output path (default: outputs/speaker_inversion/seeds/seed<SEED>_std<STD>_<MODEL>"
         ".speaker.safetensors)",
     )
     args = parser.parse_args()
@@ -47,7 +47,7 @@ def main() -> None:
     std = args.std if args.std is not None else float(cfg["train"]["speaker_inversion_init_std"])
     model = "small" if "small" in Path(args.config).name else "large"
     output = args.output or (
-        f"outputs/speaker_inversion/seeds/seed{args.seed}_{model}.speaker.safetensors"
+        f"outputs/speaker_inversion/seeds/seed{args.seed}_std{std:g}_{model}.speaker.safetensors"
     )
 
     generator = torch.Generator().manual_seed(args.seed)

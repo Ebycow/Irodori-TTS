@@ -5,6 +5,7 @@
 # Usage:
 #   scripts/train_voice.sh NAME [--review] [--trim] [--rebuild] [--force] [--small]
 #                               [--scale-steps] [--grad-ckpt] [--init-embed PATH]
+#                               [--lr LR]
 #
 #   --review   stop after transcription so metadata.csv can be corrected; rerun to continue
 #   --trim     cut non-speech stretches (SFX/noise/silence) from every clip while transcribing;
@@ -18,8 +19,10 @@
 #   --grad-ckpt    keep gradient checkpointing on (off by default: faster, needs more VRAM)
 #   --init-embed PATH  start from a shared .speaker.safetensors instead of random tokens, so
 #                  speakers trained from the same base stay token-aligned and can be blended;
-#                  the token count follows the file, and output goes to
-#                  outputs/speaker_inversion/NAME_MODEL_from-BASE unless OUT_DIR is set
+#                  the token count follows the file
+#   --lr LR        learning rate (default: the config's learning_rate)
+#
+# Output: outputs/speaker_inversion/NAME_MODEL[_from-BASE]_lrLR unless OUT_DIR is set
 #
 # Check transcripts against the audio: scripts/verify_transcripts.py data/NAME
 # Environment overrides: CKPT, CONFIG, OUT_DIR, WHISPER_ARGS (e.g. "--device cpu --compute-type int8"),
@@ -31,11 +34,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 NAME="${1:-}"
-[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,28p "$0"; exit 1; }
+[[ -n "$NAME" && "$NAME" != --* ]] || { sed -n 2,31p "$0"; exit 1; }
 shift
 
 REVIEW=0; FORCE=0; REBUILD=0; TRIM_ARGS=; MODEL=large; SCALE_STEPS=0; GRAD_CKPT=--no-gradient-checkpointing
-INIT_EMBED=
+INIT_EMBED=; LR=
 if [[ -z "${NGPU:-}" ]]; then
   if [[ -n "${SLURM_GPUS_ON_NODE:-}" ]]; then
     NGPU="$SLURM_GPUS_ON_NODE"
@@ -60,6 +63,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -gt 0 ]] || { echo "--init-embed needs a path" >&2; exit 1; }
       INIT_EMBED="$1"; shift ;;
     --init-embed=*) INIT_EMBED="${arg#*=}" ;;
+    --lr)
+      [[ $# -gt 0 ]] || { echo "--lr needs a value" >&2; exit 1; }
+      LR="$1"; shift ;;
+    --lr=*) LR="${arg#*=}" ;;
     *) echo "unknown option: $arg" >&2; exit 1 ;;
   esac
 done
@@ -75,6 +82,13 @@ fi
 AUDIO_DIR="data/$NAME"
 MANIFEST="data/${NAME}_manifest.jsonl"
 LATENT_DIR="data/${NAME}_latents"
+if [[ -n "$LR" ]]; then
+  [[ "$LR" =~ ^[0-9.]+([eE]-?[0-9]+)?$ ]] || { echo "--lr must be a number: $LR" >&2; exit 1; }
+else
+  LR=$(awk '/^[[:space:]]*learning_rate:/ {print $2; exit}' "$CONFIG")
+  [[ -n "$LR" ]] || { echo "learning_rate not found in $CONFIG" >&2; exit 1; }
+fi
+RUN="${NAME}_${MODEL}"
 if [[ -n "$INIT_EMBED" ]]; then
   [[ -f "$INIT_EMBED" ]] || { echo "init embedding not found: $INIT_EMBED" >&2; exit 1; }
   [[ "$INIT_EMBED" == *.speaker.safetensors ]] || {
@@ -82,10 +96,9 @@ if [[ -n "$INIT_EMBED" ]]; then
   # checkpoint_*.speaker.safetensors says nothing about the base, so name it after its run dir.
   INIT_STEM="$(basename "$INIT_EMBED" .speaker.safetensors)"
   [[ "$INIT_STEM" == checkpoint_* ]] && INIT_STEM="$(basename "$(dirname "$INIT_EMBED")")"
-  OUT_DIR="${OUT_DIR:-outputs/speaker_inversion/${NAME}_${MODEL}_from-${INIT_STEM}}"
-else
-  OUT_DIR="${OUT_DIR:-outputs/speaker_inversion/${NAME}_${MODEL}}"
+  RUN+="_from-${INIT_STEM}"
 fi
+OUT_DIR="${OUT_DIR:-outputs/speaker_inversion/${RUN}_lr${LR}}"
 
 [[ -d "$AUDIO_DIR" ]] || { echo "missing directory: $AUDIO_DIR" >&2; exit 1; }
 found=0
@@ -129,7 +142,7 @@ else
   echo "manifest exists, skipping (use --rebuild to redo)"
 fi
 
-TRAIN_ARGS=(--config "$CONFIG" --manifest "$MANIFEST" --init-checkpoint "$CKPT" --output-dir "$OUT_DIR" "$GRAD_CKPT")
+TRAIN_ARGS=(--config "$CONFIG" --manifest "$MANIFEST" --init-checkpoint "$CKPT" --output-dir "$OUT_DIR" "$GRAD_CKPT" --lr "$LR")
 if [[ $SCALE_STEPS -eq 1 ]]; then
   MAX_STEPS=$(awk '/^[[:space:]]*max_steps:/ {print $2; exit}' "$CONFIG")
   [[ -n "$MAX_STEPS" ]] || { echo "max_steps not found in $CONFIG" >&2; exit 1; }
@@ -143,7 +156,7 @@ if [[ -n "$INIT_EMBED" ]]; then
   TRAIN_ARGS+=(--speaker-inversion-init-embedding "$INIT_EMBED" --speaker-inversion-tokens "$INIT_TOKENS")
 fi
 
-echo "== [3/3] train ($MODEL, ${NGPU} GPU): $OUT_DIR"
+echo "== [3/3] train ($MODEL, ${NGPU} GPU, lr $LR): $OUT_DIR"
 if [[ "$NGPU" -gt 1 ]]; then
   uv run --no-sync torchrun --standalone --nproc_per_node "$NGPU" train.py "${TRAIN_ARGS[@]}"
 else
